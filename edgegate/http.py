@@ -127,21 +127,23 @@ class HttpParser:
         )
 
 
-def encode_request_head(request: Request, *, host: str, xff: str) -> bytes:
+def encode_request_head(request: Request, *, host: str | None = None, xff: str | None = None) -> bytes:
     """Render a request line + headers, with the two rewrites a proxy MUST do
     (Host and X-Forwarded-For — full rewrite rules in tutorial 10, m3).
 
-    host: the upstream "host:port" it should target.
-    xff:  the client IP to report upstream.
+    host: optional upstream "host:port" (m2 called this directly). Since m3,
+         the Router has already baked Host/XFF into request.headers — pass
+         nothing and the existing (rewritten) headers are serialized as-is.
+    xff:  optional client IP to report upstream.
     """
     lines = [f"{request.method} {request.target} {request.version}"]
     out_headers = dict(request.headers)
-    out_headers["host"] = host
-    if "x-forwarded-for" in out_headers:
-        out_headers["x-forwarded-for"] += f", {xff}"        
-    else:
+    if host is not None:
+        out_headers["host"] = host
+    if xff is not None:
         out_headers["x-forwarded-for"] = xff
-    out_headers["x-forwarded-proto"] = "http"
+    if "x-forwarded-proto" not in out_headers:
+        out_headers["x-forwarded-proto"] = "http"
     lines += [f"{k}: {v}" for k, v in out_headers.items()]
     
     return ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
