@@ -1,1 +1,14 @@
-{ "listen": "0.0.0.0:8080", "routes": [ { "id": "api", "prefix": "/api", "backends": ["127.0.0.1:3000"] } ] }
+{
+    "listen": "0.0.0.0:8080",
+    "routes": [
+        {
+            "id": "api",
+            "prefix": "/api/v1",
+            "lb": "least-connections",
+            "backends": [
+                "127.0.0.1:3001",
+                "127.0.0.1:3002"
+            ]
+        }
+    ]
+}

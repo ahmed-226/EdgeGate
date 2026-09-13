@@ -1,6 +1,14 @@
 from __future__ import annotations
 from .config import RouteConfig
 from .http import Request
+from .upstream import Backend
+from .balancer import RoundRobinBalancer, LeastConnectionsBalancer
+
+
+def _build_balancer(config: RouteConfig, backends: list[Backend]) -> LoadBalancer:
+    if config.lb == "least-connections":
+        return LeastConnectionsBalancer(backends)
+    return RoundRobinBalancer(backends)   
 
 class Route:
     """A configured route = prefix + backends + the rules attached to it.
@@ -9,7 +17,8 @@ class Route:
     self.limiter, m7 adds self.breaker. ProxyServer wires them in."""
     def __init__(self, config:RouteConfig) -> None:
         self.config = config
-
+        self.backends = [Backend(c) for c in config.backends]
+        self.balancer = _build_balancer(config, self.backends)
 
 
 class Router:
@@ -53,6 +62,4 @@ class Router:
                   "transfer-encoding", "upgrade"):
             rewritten.headers.pop(h, None)
 
-        return rewritten
-
-
+        return rewritten       

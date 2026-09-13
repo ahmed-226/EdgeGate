@@ -72,12 +72,22 @@ class ProxyConnection:
             return
 
         
-        backend = route.config.backends[0]
+        backend = route.balancer.pick()
+        if backend is None:
+            await self._finish("-", request,
+                               await self._send_error(503, "Service Unavailable",
+                                                      b"no healthy backend"),
+                               client_ip, started_at)
+            return
 
         upstream = f"{backend.host}:{backend.port}"
         rewritten = self.server.router.rewrite_request(request, route, backend, client_ip)
 
-        response = await self._forward(rewritten, backend)
+        route.balancer.acquire(backend)  # no-op for round-robin; bumps live for least-connections
+        try:
+            response = await self._forward(rewritten, backend)
+        finally:
+            route.balancer.release(backend)
 
         await self._finish(upstream, request, response, client_ip, started_at)
 
