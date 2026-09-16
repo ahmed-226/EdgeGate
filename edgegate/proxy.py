@@ -4,7 +4,9 @@ from .config import Config
 from .http import Request, Response, HttpParser, encode_request_head
 from .observability import MetricsRegistry, AccessLogger
 from .router import Router
+from .health import HealthChecker
 import time
+import logging
 
 class ProxyServer:
     def __init__(self, config: Config) -> None:
@@ -12,6 +14,8 @@ class ProxyServer:
         self.metrics = MetricsRegistry()
         self.access_logger = AccessLogger(self.metrics)
         self.router = Router(config.routes)
+        self.backends = [b for r in self.router.routes for b in r.backends]
+        self.health_checker = HealthChecker(config.health, self.backends)
 
     async def handle_client(self,reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         connection = ProxyConnection(self, reader, writer)
@@ -21,9 +25,20 @@ class ProxyServer:
     async def run(self) -> None:
         host, port = self.config.host, self.config.port
         server = await asyncio.start_server(self.handle_client,host,port)
+
+        loop = asyncio.get_running_loop()
+
+        task = loop.create_task(self.health_checker.run())
+        task.add_done_callback(self._log_task_exception)
         async with server:
-            print(f"edgegate listening on {host}:{port}")
             await server.serve_forever()
+
+    @staticmethod
+    def _log_task_exception(task) -> None:
+        if not task.cancelled() and task.exception():
+            logging.exception("background task crashed", exc_info=task.exception())
+
+
 
 class ProxyConnection:
     def __init__(self, server: "ProxyServer",
