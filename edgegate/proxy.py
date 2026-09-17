@@ -3,7 +3,8 @@ import asyncio
 from .config import Config
 from .http import Request, Response, HttpParser, encode_request_head
 from .observability import MetricsRegistry, AccessLogger
-from .router import Router
+from .router import Router, Route
+from .upstream import Backend
 from .health import HealthChecker
 import time
 import logging
@@ -13,9 +14,6 @@ class ProxyServer:
         self.config = config
         self.metrics = MetricsRegistry()
         self.access_logger = AccessLogger(self.metrics)
-        self.router = Router(config.routes)
-        self.backends = [b for r in self.router.routes for b in r.backends]
-        self.health_checker = HealthChecker(config.health, self.backends)
 
     async def handle_client(self,reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         connection = ProxyConnection(self, reader, writer)
@@ -24,9 +22,16 @@ class ProxyServer:
 
     async def run(self) -> None:
         host, port = self.config.host, self.config.port
-        server = await asyncio.start_server(self.handle_client,host,port)
-
         loop = asyncio.get_running_loop()
+
+        # The router + breaker/delay-collaborators need the RUNNING loop
+        # (CircuitBreaker schedules its cooldown via loop.call_later), so we
+        # wire them here — not in __init__, which runs before the loop exists.
+        self.router = Router(self.config.routes, loop)
+        self.backends = [b for r in self.router.routes for b in r.backends]
+        self.health_checker = HealthChecker(self.config.health, self.backends)
+
+        server = await asyncio.start_server(self.handle_client,host,port)
 
         task = loop.create_task(self.health_checker.run())
         task.add_done_callback(self._log_task_exception)
@@ -87,9 +92,8 @@ class ProxyConnection:
                                client_ip, started_at)
             return
 
-        # Rate-limit deny happens BEFORE any upstream work: a rejected request
-        # must never open a backend socket (m6 "killer proof"). Logged through
-        # _finish like every other outcome, with upstream "-" proving no contact.
+        # Rate-limit deny happens BEFORE any upstream work: a rejected request must never open a backend socket. 
+        # Logged through _finish like every other outcome, with upstream "-" proving no contact.
         if route.limiter is not None:
             rate_cfg = route.config.rate_limit
             allowed = route.limiter.try_acquire(
@@ -103,24 +107,18 @@ class ProxyConnection:
                                    client_ip, started_at)
                 return
 
-        backend = route.balancer.pick()
-        if backend is None:
+        # Circuit breaker + bounded failover: consult the breaker, then try healthy backends one at a time. OutageError means the breaker
+        # refused (OPEN) OR every attempt failed — both are a proxy-side 503 with zero upstream traffic in the OPEN case.
+        try:
+            backend, response = await self._forward_with_retry(request, route, client_ip)
+        except OutageError:
             await self._finish("-", request,
                                await self._send_error(503, "Service Unavailable",
-                                                      b"no healthy backend"),
+                                                      b"no healthy backend / circuit open"),
                                client_ip, started_at)
             return
 
-        upstream = f"{backend.host}:{backend.port}"
-        rewritten = self.server.router.rewrite_request(request, route, backend, client_ip)
-
-        route.balancer.acquire(backend)  # no-op for round-robin; bumps live for least-connections
-        try:
-            response = await self._forward(rewritten, backend)
-        finally:
-            route.balancer.release(backend)
-
-        await self._finish(upstream, request, response, client_ip, started_at)
+        await self._finish(backend.address, request, response, client_ip, started_at)
 
     async def _finish(self, upstream: str, request: Request, response: Response,
                       client_ip: str, started_at: float) -> None:
@@ -135,8 +133,7 @@ class ProxyConnection:
 
     async def _send_error(self, status: int, reason: str, body: bytes,
                           *, retry_after: int | None = None) -> Response:
-        """Write a proxy-generated response (m2 promised this). Returns the
-        Response object so callers can feed it straight into the access logger.
+        """Write a proxy-generated response. Returns the Response object so callers can feed it straight into the access logger.
         Content-Length framing — no keep-alive this milestone.
 
         retry_after: for 429 the RFC 7231 hint tells clients when to try again;
@@ -154,27 +151,79 @@ class ProxyConnection:
         self.writer.write(self._render_response_head(response) + response.body)
         await self.writer.drain()
         return response
+    
+    async def _forward_with_retry(self, request: Request, route: Route,
+                                  client_ip: str) -> tuple[Backend, Response]:
+        """Try healthy backends one at a time, bounded by the pool size.
+        Each attempt re-picks via the balancer so we never use the same
+        backend twice if the pool still has alternatives. Returns the backend
+        that served us so the access log can name it."""
+        breaker = route.breaker
 
-    async def _forward(self, request: Request, backend) -> Response:
-        peer_ip = self.writer.get_extra_info("peername")[0]
-        async with asyncio.timeout(2):
-            up_reader, up_writer = await asyncio.open_connection(backend.host, backend.port)
+        if not breaker.is_allowed():
+            # OPEN (or HALF_OPEN without probes left): refuse WITHOUT touching
+            # the network — this is the breaker's entire reason to exist.
+            self.server.metrics.incr("circuit_open_rejections")
+            raise OutageError("circuit open")
+
+        # Bounded retries: at most len(pool) attempts per request.
+        last_error: Exception | None = None
+        attempted: set[Backend] = set()
+        for _ in range(max(1, len(route.backends))):
+            backend = route.balancer.pick()
+            if backend is None or backend in attempted:
+                break                             # all unhealthy / pool exhausted
+            attempted.add(backend)
+
+            route.balancer.acquire(backend)
+            try:
+                # Rewriting is per-attempt: the rewritten Host must name THIS
+                # backend, so it happens after each pick.
+                rewritten = self.server.router.rewrite_request(request, route, backend, client_ip)
+                response = await self._forward(rewritten, backend, client_ip)
+                breaker.record_success()
+                return backend, response
+            except UpstreamError as e:
+                last_error = e
+                breaker.record_failure()
+                # fall through → next attempt (different backend) unless breaker OPEN
+                if not breaker.is_allowed():
+                    break
+            finally:
+                route.balancer.release(backend)
+
+        raise OutageError(str(last_error)) if last_error else OutageError("no healthy backend")
+
+
+    async def _forward(self, request: Request, backend: Backend, client_ip: str) -> Response:
+        """Open one upstream connection, send the request, read the response,
+        relay it to the client. ANY upstream misbehavior raises UpstreamError
+        (breaker-worthy); success returns the parsed Response for logging."""
+        try:
+            async with asyncio.timeout(2):
+                reader, writer = await asyncio.open_connection(backend.host, backend.port)
+        except (OSError, TimeoutError) as e:
+            raise UpstreamError(f"connect failed: {e}") from e
         try:
             head = encode_request_head(request)
             async with asyncio.timeout(10):
-                up_writer.write(head + request.body)
-                await up_writer.drain()
+                writer.write(head + request.body)
+                await writer.drain()
             async with asyncio.timeout(30):
-                response = await HttpParser.read_response(up_reader)
-            async with asyncio.timeout(30):
-                self.writer.write(self._render_response_head(response))
-                self.writer.write(response.body)
-                await self.writer.drain()
+                response = await HttpParser.read_response(reader)
+            await self._relay(response)
             return response
+        except (TimeoutError, ConnectionError, OSError) as e:
+            raise UpstreamError(str(e)) from e
         finally:
-            up_writer.close()
-            await up_writer.wait_closed()
+            writer.close()
+            await writer.wait_closed()
 
+    async def _relay(self, response: Response) -> None:
+        """Re-serialize the upstream response head + body to the client (m2)."""
+        self.writer.write(self._render_response_head(response))
+        self.writer.write(response.body)
+        await self.writer.drain()
 
 
     @staticmethod
@@ -184,3 +233,9 @@ class ProxyConnection:
         lines += [f"{k}: {v}" for k, v in response.headers.items()]
         return ("\r\n".join(lines) + "\r\n\r\n").encode("ascii")
 
+
+class UpstreamError(Exception):        
+    """Upstream connect/timeout/protocol failure — breaker-worthy."""
+
+class OutageError(Exception):          
+    """No way to serve this request right now → 503 without retries."""

@@ -4,6 +4,7 @@ from .http import Request
 from .upstream import Backend
 from .balancer import RoundRobinBalancer, LeastConnectionsBalancer
 from .ratelimit import RateLimiter
+from .circuit import CircuitBreaker
 
 def _build_balancer(config: RouteConfig, backends: list[Backend]) -> LoadBalancer:
     if config.lb == "least-connections":
@@ -15,19 +16,21 @@ class Route:
 
     Deliberately a plain holder for now. m4 adds self.balancer, m6 adds
     self.limiter, m7 adds self.breaker. ProxyServer wires them in."""
-    def __init__(self, config:RouteConfig) -> None:
+    def __init__(self, config:RouteConfig, loop) -> None:
         self.config = config
         self.backends = [Backend(c) for c in config.backends]
         self.balancer = _build_balancer(config, self.backends)
         self.limiter = RateLimiter() if config.rate_limit is not None else None
+        self.breaker = CircuitBreaker(config.circuit, loop)  
+
 
 
 
 class Router:
     """Owns every Route and the two rules: matching and rewriting."""
-    def __init__(self, route_configs:list[RouteConfig]) -> None:
+    def __init__(self, route_configs:list[RouteConfig], loop) -> None:
         
-        self.routes = sorted((Route(c) for c in route_configs),
+        self.routes = sorted((Route(c, loop) for c in route_configs),
                              key = lambda r:len(r.config.prefix),reverse=True)
 
     def match(self, path:str) -> Route | None:
