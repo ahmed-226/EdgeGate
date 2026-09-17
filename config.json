@@ -1,15 +1,17 @@
 {
-    "listen": "0.0.0.0:8080",
-    "health": { "path": "/healthz", "interval_s": 2.0, "timeout_s": 1.0, "unhealthy_threshold": 2 },
-    "routes": [
-        {
-            "id": "api",
-            "prefix": "/api/v1",
-            "lb": "round-robin",
-            "backends": [
-                "127.0.0.1:3001",
-                "127.0.0.1:3002"
-            ]
-        }
-    ]
+  "listen": "0.0.0.0:8080",
+  "health": {
+    "path": "/healthz",
+    "interval_s": 2.0,
+    "timeout_s": 1.0,
+    "unhealthy_threshold": 2
+  },
+  "routes": [
+    {
+      "id": "api",
+      "prefix": "/api",
+      "backends": ["127.0.0.1:3001"],
+      "rate_limit": { "per_ip": 3, "per_seconds": 10, "burst": 3 }
+    }
+  ]
 }

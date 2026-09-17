@@ -3,7 +3,7 @@ from .config import RouteConfig
 from .http import Request
 from .upstream import Backend
 from .balancer import RoundRobinBalancer, LeastConnectionsBalancer
-
+from .ratelimit import RateLimiter
 
 def _build_balancer(config: RouteConfig, backends: list[Backend]) -> LoadBalancer:
     if config.lb == "least-connections":
@@ -19,6 +19,8 @@ class Route:
         self.config = config
         self.backends = [Backend(c) for c in config.backends]
         self.balancer = _build_balancer(config, self.backends)
+        self.limiter = RateLimiter() if config.rate_limit is not None else None
+
 
 
 class Router:

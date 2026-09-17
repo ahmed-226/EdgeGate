@@ -79,6 +79,7 @@ class ProxyConnection:
             return
 
         route = self.server.router.match(request.target)
+
         if route is None:
             # No route matched: 404 straight from the proxy (the router's own response, nothing upstream involved).
             await self._finish("-", request,
@@ -86,7 +87,22 @@ class ProxyConnection:
                                client_ip, started_at)
             return
 
-        
+        # Rate-limit deny happens BEFORE any upstream work: a rejected request
+        # must never open a backend socket (m6 "killer proof"). Logged through
+        # _finish like every other outcome, with upstream "-" proving no contact.
+        if route.limiter is not None:
+            rate_cfg = route.config.rate_limit
+            allowed = route.limiter.try_acquire(
+                route.config.id, client_ip, rate_cfg, time.perf_counter())
+            if not allowed:
+                self.server.metrics.incr("rate_limited")
+                await self._finish("-", request,
+                                   await self._send_error(429, "Too Many Requests",
+                                                          b"rate limit exceeded",
+                                                          retry_after=1),
+                                   client_ip, started_at)
+                return
+
         backend = route.balancer.pick()
         if backend is None:
             await self._finish("-", request,
@@ -117,15 +133,22 @@ class ProxyConnection:
         )
 
 
-    async def _send_error(self, status: int, reason: str, body: bytes) -> Response:
+    async def _send_error(self, status: int, reason: str, body: bytes,
+                          *, retry_after: int | None = None) -> Response:
         """Write a proxy-generated response (m2 promised this). Returns the
         Response object so callers can feed it straight into the access logger.
-        Content-Length framing — no keep-alive this milestone."""
+        Content-Length framing — no keep-alive this milestone.
+
+        retry_after: for 429 the RFC 7231 hint tells clients when to try again;
+        the token bucket's refill rate already tells us the honest seconds."""
+        headers = {"Content-Length": str(len(body)),
+                   "Content-Type": "text/plain",
+                   "Connection": "close"}
+        if retry_after is not None:
+            headers["Retry-After"] = str(retry_after)
         response = Response(
             version="HTTP/1.1", status_code=status, reason=reason,
-            headers={"Content-Length": str(len(body)),
-                     "Content-Type": "text/plain",
-                     "Connection": "close"},
+            headers=headers,
             body=body,
         )
         self.writer.write(self._render_response_head(response) + response.body)
