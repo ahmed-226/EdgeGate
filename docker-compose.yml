@@ -1,0 +1,30 @@
+services:
+  edgegate:
+    build: .
+    ports:
+      - "8080:8080"
+    depends_on: [backend-1, backend-2, chaos]   # start order hint
+    healthcheck:                                  # compose-level liveness
+      test: ["CMD-SHELL",
+             "python -c 'import urllib.request,sys;sys.exit(urllib.request.urlopen(\"http://127.0.0.1:8080/healthz\",timeout=2).status!=200)'"]
+      interval: 5s
+      timeout: 2s
+      retries: 3
+
+  backend-1:
+    image: python:3.12-alpine
+    command: ["python", "/app/backend.py", "--port", "3000"]
+    volumes: ["./demo/backend.py:/app/backend.py:ro"]     # :ro keeps the file read-only in the container
+    environment: { NAME: backend-1, PYTHONUNBUFFERED: "1" }
+
+  backend-2:
+    image: python:3.12-alpine
+    command: ["python", "/app/backend.py", "--port", "3000"]
+    volumes: ["./demo/backend.py:/app/backend.py:ro"]
+    environment: { NAME: backend-2, PYTHONUNBUFFERED: "1" }
+
+  chaos:
+    image: python:3.12-alpine
+    command: ["python", "/app/chaos.py", "--port", "3000"]
+    volumes: ["./demo/chaos.py:/app/chaos.py:ro"]
+    environment: { NAME: chaos, PYTHONUNBUFFERED: "1", FAIL_RATE: "${FAIL_RATE:-0}", SLEEP_MS: "${SLEEP_MS:-1500}" }

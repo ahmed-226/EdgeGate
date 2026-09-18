@@ -1,21 +1,23 @@
 {
   "listen": "0.0.0.0:8080",
-  "health": {
-    "path": "/healthz",
-    "interval_s": 999999.0,
-    "timeout_s": 1.0,
-    "unhealthy_threshold": 2
-  },
   "routes": [
     {
       "id": "api",
-      "prefix": "/api",
-      "backends": ["127.0.0.1:3001"],
+      "prefix": "/api/v1",
+      "backends": ["backend-1:3000", "backend-2:3000", "chaos:3000"],
+      "lb": "least-connections",
+      "rate_limit": { "per_ip": 20, "per_seconds": 10, "burst": 5 },
       "circuit": {
-        "consecutive_failures": 2,
-        "cooldown_s": 8,
+        "consecutive_failures": 3,
+        "cooldown_s": 20,
         "halfopen_probes": 2
       }
     }
-  ]
+  ],
+  "health": {
+    "path": "/healthz",
+    "interval_s": 4,
+    "timeout_s": 2,
+    "unhealthy_threshold": 2
+  }
 }

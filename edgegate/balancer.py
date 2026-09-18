@@ -49,11 +49,20 @@ class LeastConnectionsBalancer(LoadBalancer):
     """Pick the usable backend with the fewest in-flight requests. A slow backend
     accumulates `live` and sheds load by itself"""
 
+    def __init__(self, backends: list[Backend]) -> None:
+        super().__init__(backends)
+        self._index = -1
+
     def pick(self) -> Backend | None:
         usable = self._usable()
         if not usable:
             return None
-        return min(usable, key=lambda b: b.live)
+        min_live = min(b.live for b in usable)
+        # ties resolved by rotation — an idle pool must cycle, not pin
+        # itself to the first backend (mirrors RoundRobinBalancer logic).
+        candidates = [b for b in usable if b.live == min_live]
+        self._index = (self._index + 1) % len(candidates)
+        return candidates[self._index]
 
     def release(self, backend: Backend) -> None:
         if backend.live > 0:
