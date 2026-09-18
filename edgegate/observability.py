@@ -48,5 +48,7 @@ class AccessLogger:
 
         self.metrics.incr("total_requests")
         self.metrics.incr(f"status.{entry['status']}")
+        self.metrics.incr("bytes_in_total", bytes_in)
+        self.metrics.incr("bytes_out_total", bytes_out)
 
 

@@ -6,6 +6,7 @@ Env knobs:
 Toggling env + restart is how verify.sh 'breaks' a backend (M9)."""
 from __future__ import annotations
 import argparse
+import json
 import os
 import random
 import time
@@ -38,7 +39,17 @@ class ChaosHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"chaos 500")
             return
 
-        body = b'{"instance":"chaos","status":"ok"}'
+        # Same echo contract as backend.py so assertions work no matter which
+        # replica answers — only "instance" differs (chaos vs backend-N).
+        payload = {
+            "instance": "chaos",
+            "path": self.path,
+            "client_ip": self.headers.get("X-Real-IP"),
+            "xff": self.headers.get("X-Forwarded-For"),
+            "host_header": self.headers.get("Host"),
+            "status": "ok",
+        }
+        body = json.dumps(payload).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

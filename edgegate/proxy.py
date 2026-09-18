@@ -33,10 +33,34 @@ class ProxyServer:
 
         server = await asyncio.start_server(self.handle_client,host,port)
 
-        task = loop.create_task(self.health_checker.run())
-        task.add_done_callback(self._log_task_exception)
-        async with server:
-            await server.serve_forever()
+        tasks = [
+            loop.create_task(self.health_checker.run()),
+            loop.create_task(self._prune_rate_limiters()),
+        ]
+        for task in tasks:
+            task.add_done_callback(self._log_task_exception)
+
+        logging.getLogger("edgegate").info("listening on %s:%d", host, port)
+        try:
+            async with server:
+                await server.serve_forever()
+        except KeyboardInterrupt:
+            logging.getLogger("edgegate").info("shutting down")
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _prune_rate_limiters(self) -> None:
+        """Periodic memory hygiene (m9): drop token-bucket state for client
+        IPs that stopped sending long ago (default >15 min idle). One pass is
+        tiny — every 60s is plenty."""
+        while True:
+            now = time.perf_counter()
+            for route in self.router.routes:
+                if route.limiter is not None:
+                    route.limiter.prune_stale(now)
+            await asyncio.sleep(60)
 
     @staticmethod
     def _log_task_exception(task) -> None:
